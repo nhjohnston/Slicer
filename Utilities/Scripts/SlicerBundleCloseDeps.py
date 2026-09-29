@@ -110,6 +110,15 @@ def is_system(ref):
     return ref.startswith("/usr/lib") or ref.startswith("/System/")
 
 
+def is_protected(path, protected):
+    """True if path's basename contains a match for one of the ``protected``
+    regexes -- a vendor library that must be left byte-for-byte untouched (id,
+    load commands, rpaths all left as installed).
+    """
+    name = os.path.basename(path)
+    return any(pattern.search(name) for pattern in protected)
+
+
 def framework_relative(path):
     """For a path inside a ``*.framework``, return (framework_dir, inner) where
     inner is the path from the framework directory's parent (i.e. begins with
@@ -191,7 +200,7 @@ def resolve(ref, binary_dir, rpaths, search_dirs, exe_dir):
     return None
 
 
-def close_deps(app, search_dirs):
+def close_deps(app, search_dirs, protected=()):
     contents = os.path.join(app, "Contents")
     exe_dir = os.path.join(contents, "MacOS")
     frameworks_dir = os.path.join(contents, "Frameworks")
@@ -211,17 +220,30 @@ def close_deps(app, search_dirs):
         return found
 
     # Index every Mach-O already in the bundle by basename, so a reference to an
-    # external library of that name is redirected to the embedded copy.
+    # external library of that name is redirected to the embedded copy. This
+    # includes protected libraries: they must still be found by name, just
+    # never scanned or rewritten themselves.
     embedded = {}
-    worklist = bundle_machos(app)
-    for path in worklist:
+    all_machos = bundle_machos(app)
+    worklist = []
+    skipped = []
+    for path in all_machos:
         embedded.setdefault(os.path.basename(path), path)
+        if is_protected(path, protected):
+            skipped.append(path)
+        else:
+            worklist.append(path)
+    if skipped:
+        print("SlicerBundleCloseDeps: left %d protected Mach-O file(s) untouched:" % len(skipped))
+        for path in skipped:
+            print("  protected:", path)
 
     # Deferred install_name_tool work, applied in parallel once the graph is
     # fully walked (each binary's rewrite is independent of the others).
     id_resets = {}          # path -> new LC_ID_DYLIB
     changes = {}            # path -> list of (old_ref, new_ref)
     copied = []
+    protected_redirects_warned = set()
     seen = set()
 
     def embed(source):
@@ -238,7 +260,7 @@ def close_deps(app, search_dirs):
                 # and helpers such as QtWebEngineProcess); register and walk them.
                 for macho in bundle_machos(dest_fw):
                     embedded.setdefault(os.path.basename(macho), macho)
-                    if macho not in seen:
+                    if not is_protected(macho, protected) and macho not in seen:
                         worklist.append(macho)
             target = os.path.join(dest_fw, os.sep.join(inner.split(os.sep)[1:]))
         else:
@@ -247,7 +269,8 @@ def close_deps(app, search_dirs):
             if not os.path.exists(target):
                 shutil.copy2(source, target)
                 os.chmod(target, 0o755)
-                worklist.append(target)
+                if not is_protected(target, protected):
+                    worklist.append(target)
         embedded.setdefault(os.path.basename(target), target)
         copied.append(os.path.basename(target))
         return target
@@ -277,6 +300,11 @@ def close_deps(app, search_dirs):
                 continue
             name = os.path.basename(source)
             target = embedded[name] if name in embedded else embed(source)
+            if is_protected(target, protected) and target not in protected_redirects_warned:
+                print("SlicerBundleCloseDeps: warning: redirecting a dependency to "
+                      "protected library %s; its LC_ID_DYLIB is not reset, so dyld "
+                      "may load a separate copy instead of coalescing it" % target)
+                protected_redirects_warned.add(target)
             new_ref = "@rpath/" + os.path.relpath(target, contents)
             if new_ref != ref:
                 changes.setdefault(current, []).append((ref, new_ref))
@@ -304,7 +332,7 @@ def close_deps(app, search_dirs):
     return True
 
 
-def fix_executable_rpaths(app):
+def fix_executable_rpaths(app, protected=()):
     """Give every standalone Mach-O executable in the bundle a run-path pointing
     at Contents, so its @rpath dependencies resolve when it is launched on its
     own rather than loaded by the application (which supplies that run-path).
@@ -314,6 +342,8 @@ def fix_executable_rpaths(app):
     for directory, _dirs, files in os.walk(app):
         for name in files:
             path = os.path.join(directory, name)
+            if is_protected(path, protected):
+                continue
             if not is_macho(path) or not is_executable_macho(path):
                 continue
             loads, rpaths, _id = scan(path)
@@ -330,7 +360,7 @@ def fix_executable_rpaths(app):
     return fixed
 
 
-def strip_external_rpaths(app):
+def strip_external_rpaths(app, protected=()):
     """Remove run-paths that point outside the bundle (build-tree or Homebrew
     directories left over from linking). After the closure every dependency
     resolves through a @loader_path-relative run-path, so these absolute entries
@@ -356,6 +386,8 @@ def strip_external_rpaths(app):
     for directory, _dirs, files in os.walk(app):
         for name in files:
             path = os.path.join(directory, name)
+            if is_protected(path, protected):
+                continue
             if is_macho(path):
                 machos.append(path)
     with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
@@ -371,15 +403,28 @@ def main(argv):
                         help="Directory to resolve @rpath dependencies against "
                              "(repeatable). The referring binary's own run-paths "
                              "are always searched first.")
+    parser.add_argument("--protect", action="append", default=[], metavar="REGEX",
+                        help="Regex (unanchored search against basename) of Mach-O files to "
+                            "leave byte-for-byte untouched -- neither re-id'd, "
+                            "rewritten nor rpath-adjusted; their dependencies "
+                            "are not resolved or embedded (repeatable).")
     options = parser.parse_args(argv)
     if not os.path.isdir(options.app):
         print("SlicerBundleCloseDeps: no such bundle: %s" % options.app, file=sys.stderr)
         return 1
     search_dirs = [d for d in options.search_path if d and os.path.isdir(d)]
-    if not close_deps(options.app, search_dirs):
+    protected = []
+    for pattern in options.protect:
+        try:
+            protected.append(re.compile(pattern))
+        except re.error as error:
+            print("SlicerBundleCloseDeps: invalid --protect regex %r: %s" %
+                  (pattern, error), file=sys.stderr)
+            return 1
+    if not close_deps(options.app, search_dirs, protected):
         return 1
-    fix_executable_rpaths(options.app)
-    strip_external_rpaths(options.app)
+    fix_executable_rpaths(options.app, protected)
+    strip_external_rpaths(options.app, protected)
     return 0
 
 
