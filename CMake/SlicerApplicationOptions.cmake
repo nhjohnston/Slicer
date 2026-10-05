@@ -206,6 +206,21 @@ if(WIN32)
 endif()
 
 #-----------------------------------------------------------------------------
+# Installer file associations
+#-----------------------------------------------------------------------------
+if(WIN32)
+  # File extensions that the installer associates with the application, so that
+  # opening such a file starts the application with the file path as argument.
+  if(NOT DEFINED Slicer_CPACK_NSIS_FILE_EXTENSIONS)
+    set(Slicer_CPACK_NSIS_FILE_EXTENSIONS ".mrml;.xcat;.mrb" CACHE STRING
+      "File extensions that the NSIS installer associates with the application")
+    mark_as_advanced(Slicer_CPACK_NSIS_FILE_EXTENSIONS)
+  endif()
+  mark_as_superbuild(Slicer_CPACK_NSIS_FILE_EXTENSIONS:STRING)
+  message(STATUS "Configuring ${Slicer_MAIN_PROJECT_APPLICATION_NAME} NSIS installer file extensions [${Slicer_CPACK_NSIS_FILE_EXTENSIONS}]")
+endif()
+
+#-----------------------------------------------------------------------------
 # Set Slicer_STORE_SETTINGS_IN_APPLICATION_HOME_DIR
 #-----------------------------------------------------------------------------
 #

@@ -595,7 +595,7 @@ Pop $0
   # -------------------------------------------------------------------------
   # File extensions
   # -------------------------------------------------------------------------
-  set(FILE_EXTENSIONS .mrml .xcat .mrb)
+  set(FILE_EXTENSIONS ${Slicer_CPACK_NSIS_FILE_EXTENSIONS})
   if(FILE_EXTENSIONS)
     # Register the ProgID (also used as URL protocol handler) and its open command
     set(CPACK_NSIS_EXTRA_INSTALL_COMMANDS
